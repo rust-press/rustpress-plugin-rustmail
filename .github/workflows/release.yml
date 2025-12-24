@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  PLUGIN_NAME: rustmail
+
+jobs:
+  build:
+    name: Build Plugin
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create plugin package
+        run: |
+          mkdir -p plugin-package/${{ env.PLUGIN_NAME }}
+          cp -r src plugin-package/${{ env.PLUGIN_NAME }}/
+          cp Cargo.toml plugin-package/${{ env.PLUGIN_NAME }}/
+          cp README.md plugin-package/${{ env.PLUGIN_NAME }}/ 2>/dev/null || true
+          cp LICENSE* plugin-package/${{ env.PLUGIN_NAME }}/ 2>/dev/null || true
+          cp plugin.toml plugin-package/${{ env.PLUGIN_NAME }}/ 2>/dev/null || true
+
+          cat > plugin-package/${{ env.PLUGIN_NAME }}/manifest.json << EOF
+          {
+            "name": "${{ env.PLUGIN_NAME }}",
+            "version": "${{ steps.version.outputs.VERSION }}",
+            "rustpress_version": ">=0.1.0",
+            "description": "Email plugin for RustPress"
+          }
+          EOF
+
+          cd plugin-package
+          zip -r ../rustpress-plugin-${{ env.PLUGIN_NAME }}-${{ steps.version.outputs.VERSION }}.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustpress-plugin-${{ env.PLUGIN_NAME }}
+          path: rustpress-plugin-${{ env.PLUGIN_NAME }}-*.zip
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rustpress-plugin-${{ env.PLUGIN_NAME }}
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

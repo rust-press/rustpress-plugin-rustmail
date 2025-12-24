@@ -2,16 +2,125 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
 
 env:
   CARGO_TERM_COLOR: always
   PLUGIN_NAME: rustmail
 
 jobs:
+  determine-version:
+    name: Determine Version
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.version.outputs.new_version }}
+      current_version: ${{ steps.version.outputs.current_version }}
+      should_release: ${{ steps.version.outputs.should_release }}
+      bump_type: ${{ steps.version.outputs.bump_type }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version bump from commits
+        id: version
+        run: |
+          # Get current version from Cargo.toml
+          CURRENT_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+          # Get the bump type from input or analyze commits
+          if [ "${{ github.event.inputs.version_bump }}" != "" ] && [ "${{ github.event.inputs.version_bump }}" != "auto" ]; then
+            BUMP_TYPE="${{ github.event.inputs.version_bump }}"
+          else
+            # Analyze commit messages since last tag
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+            if [ -z "$LAST_TAG" ]; then
+              COMMITS=$(git log --pretty=format:"%s" HEAD)
+            else
+              COMMITS=$(git log --pretty=format:"%s" ${LAST_TAG}..HEAD)
+            fi
+
+            # Default to no release
+            BUMP_TYPE="none"
+
+            # Check for version bump indicators in commit messages
+            # Priority: major > minor > patch
+
+            # BREAKING CHANGE or ! after type = major
+            if echo "$COMMITS" | grep -qiE "(BREAKING CHANGE|^[a-z]+(\([^)]+\))?!:)"; then
+              BUMP_TYPE="major"
+            # feat: = minor
+            elif echo "$COMMITS" | grep -qiE "^feat(\([^)]+\))?:"; then
+              BUMP_TYPE="minor"
+            # fix:, perf:, etc. = patch
+            elif echo "$COMMITS" | grep -qiE "^(fix|perf|refactor|docs|style|test|chore|build|ci)(\([^)]+\))?:"; then
+              BUMP_TYPE="patch"
+            # [major], [minor], [patch] tags
+            elif echo "$COMMITS" | grep -qi "\[major\]"; then
+              BUMP_TYPE="major"
+            elif echo "$COMMITS" | grep -qi "\[minor\]"; then
+              BUMP_TYPE="minor"
+            elif echo "$COMMITS" | grep -qi "\[patch\]"; then
+              BUMP_TYPE="patch"
+            # #major, #minor, #patch tags
+            elif echo "$COMMITS" | grep -qi "#major"; then
+              BUMP_TYPE="major"
+            elif echo "$COMMITS" | grep -qi "#minor"; then
+              BUMP_TYPE="minor"
+            elif echo "$COMMITS" | grep -qi "#patch"; then
+              BUMP_TYPE="patch"
+            fi
+          fi
+
+          echo "bump_type=$BUMP_TYPE" >> $GITHUB_OUTPUT
+
+          # Calculate new version
+          if [ "$BUMP_TYPE" = "none" ]; then
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "new_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          else
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+
+            case $BUMP_TYPE in
+              major)
+                MAJOR=$((MAJOR + 1))
+                MINOR=0
+                PATCH=0
+                ;;
+              minor)
+                MINOR=$((MINOR + 1))
+                PATCH=0
+                ;;
+              patch)
+                PATCH=$((PATCH + 1))
+                ;;
+            esac
+
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Version: $CURRENT_VERSION -> $NEW_VERSION (bump: $BUMP_TYPE)"
+
   build:
     name: Build Plugin
+    needs: determine-version
+    if: needs.determine-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -29,12 +138,12 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Update version in Cargo.toml
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${{ needs.determine-version.outputs.new_version }}\"/" Cargo.toml
+
       - name: Build release
         run: cargo build --release
-
-      - name: Extract version from tag
-        id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Create plugin package
         run: |
@@ -44,34 +153,57 @@ jobs:
           cp README.md plugin-package/${{ env.PLUGIN_NAME }}/ 2>/dev/null || true
           cp LICENSE* plugin-package/${{ env.PLUGIN_NAME }}/ 2>/dev/null || true
           cp plugin.toml plugin-package/${{ env.PLUGIN_NAME }}/ 2>/dev/null || true
+          cp -r migrations plugin-package/${{ env.PLUGIN_NAME }}/ 2>/dev/null || true
+          cp -r templates plugin-package/${{ env.PLUGIN_NAME }}/ 2>/dev/null || true
+          cp -r assets plugin-package/${{ env.PLUGIN_NAME }}/ 2>/dev/null || true
 
+          # Create plugin manifest
           cat > plugin-package/${{ env.PLUGIN_NAME }}/manifest.json << EOF
           {
             "name": "${{ env.PLUGIN_NAME }}",
-            "version": "${{ steps.version.outputs.VERSION }}",
+            "version": "${{ needs.determine-version.outputs.new_version }}",
             "rustpress_version": ">=0.1.0",
-            "description": "Email plugin for RustPress"
+            "description": "RustPress plugin for rustmail functionality"
           }
           EOF
 
           cd plugin-package
-          zip -r ../rustpress-plugin-${{ env.PLUGIN_NAME }}-${{ steps.version.outputs.VERSION }}.zip .
+          zip -r ../rustpress-plugin-${{ env.PLUGIN_NAME }}-v${{ needs.determine-version.outputs.new_version }}.zip .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: rustpress-plugin-${{ env.PLUGIN_NAME }}
-          path: rustpress-plugin-${{ env.PLUGIN_NAME }}-*.zip
+          path: rustpress-plugin-${{ env.PLUGIN_NAME }}-v${{ needs.determine-version.outputs.new_version }}.zip
 
   release:
     name: Create Release
-    needs: build
+    needs: [determine-version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update version in Cargo.toml
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${{ needs.determine-version.outputs.new_version }}\"/" Cargo.toml
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore: bump version to ${{ needs.determine-version.outputs.new_version }}" || true
+          git push || true
+
+      - name: Create and push tag
+        run: |
+          git tag -a "v${{ needs.determine-version.outputs.new_version }}" -m "Release v${{ needs.determine-version.outputs.new_version }}"
+          git push origin "v${{ needs.determine-version.outputs.new_version }}"
 
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -79,12 +211,61 @@ jobs:
           name: rustpress-plugin-${{ env.PLUGIN_NAME }}
           path: artifacts
 
+      - name: Generate changelog
+        id: changelog
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          if [ -z "$LAST_TAG" ]; then
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" HEAD)
+          else
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" ${LAST_TAG}..HEAD^)
+          fi
+
+          echo "## What's Changed" > changelog.md
+          echo "" >> changelog.md
+
+          # Breaking changes
+          BREAKING=$(echo "$CHANGELOG" | grep -iE "BREAKING|^- [a-z]+(\([^)]+\))?!:" || true)
+          if [ -n "$BREAKING" ]; then
+            echo "### Breaking Changes" >> changelog.md
+            echo "$BREAKING" >> changelog.md
+            echo "" >> changelog.md
+          fi
+
+          # Features
+          FEATURES=$(echo "$CHANGELOG" | grep -iE "^- feat" || true)
+          if [ -n "$FEATURES" ]; then
+            echo "### Features" >> changelog.md
+            echo "$FEATURES" >> changelog.md
+            echo "" >> changelog.md
+          fi
+
+          # Fixes
+          FIXES=$(echo "$CHANGELOG" | grep -iE "^- fix" || true)
+          if [ -n "$FIXES" ]; then
+            echo "### Bug Fixes" >> changelog.md
+            echo "$FIXES" >> changelog.md
+            echo "" >> changelog.md
+          fi
+
+          # Other
+          OTHER=$(echo "$CHANGELOG" | grep -viE "BREAKING|^- feat|^- fix|^- [a-z]+(\([^)]+\))?!:" || true)
+          if [ -n "$OTHER" ]; then
+            echo "### Other Changes" >> changelog.md
+            echo "$OTHER" >> changelog.md
+          fi
+
+          cat changelog.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: v${{ needs.determine-version.outputs.new_version }}
+          name: ${{ env.PLUGIN_NAME }} v${{ needs.determine-version.outputs.new_version }}
+          body_path: changelog.md
           files: artifacts/*.zip
-          generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+          prerelease: ${{ contains(needs.determine-version.outputs.new_version, 'alpha') || contains(needs.determine-version.outputs.new_version, 'beta') || contains(needs.determine-version.outputs.new_version, 'rc') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
